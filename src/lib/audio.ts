@@ -28,6 +28,10 @@ export function playStartBeep(): void {
 	playBeep(880, 0.4);
 }
 
+export function playCountdownTick(): void {
+	playBeep(660, 0.15);
+}
+
 export function playResultBeep(): void {
 	playBeep(440, 0.2);
 }

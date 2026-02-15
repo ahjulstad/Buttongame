@@ -1,39 +1,31 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { playStartBeep, playResultBeep } from '$lib/audio';
+	import { playStartBeep, playCountdownTick, playResultBeep } from '$lib/audio';
+	import {
+		TARGET_SECONDS,
+		SYNC_ROUNDS,
+		BEEP_DELAY_MS,
+		PEER_ID,
+		formatTime,
+		calculateResult,
+		sortResults,
+		computeClockOffset,
+		medianOffset,
+		type GamePhase,
+		type PlayerResult,
+		type PeerMessage
+	} from '$lib/game';
 	import Peer, { type DataConnection } from 'peerjs';
-
-	const TARGET_SECONDS = 13;
-	const SYNC_ROUNDS = 5;
-	const SYNC_BUFFER_MS = 1500;
-
-	type GamePhase = 'home' | 'lobby' | 'syncing' | 'playing' | 'pressed' | 'results';
-
-	interface PlayerResult {
-		name: string;
-		time: number;
-		diff: number;
-	}
-
-	type PeerMessage =
-		| { type: 'join'; name: string }
-		| { type: 'player-list'; players: string[] }
-		| { type: 'sync-ping'; t1: number }
-		| { type: 'sync-pong'; t1: number; t2: number }
-		| { type: 'scheduled-start'; beepAt: number }
-		| { type: 'result'; name: string; time: number }
-		| { type: 'all-results'; results: PlayerResult[] };
 
 	let phase = $state<GamePhase>('home');
 	let isHost = $state(false);
 	let playerName = $state('');
-	let roomCode = $state('');
-	let joinCode = $state('');
 	let players = $state<string[]>([]);
 	let myTime = $state<number | null>(null);
 	let results = $state<PlayerResult[]>([]);
 	let beepTimestamp = $state(0);
 	let buttonLit = $state(false);
+	let countdown = $state<number | null>(null);
 	let error = $state('');
 	let peer: Peer | null = null;
 	let connections = $state<DataConnection[]>([]);
@@ -43,19 +35,6 @@
 
 	// Host-side clock sync: resolvers waiting for pong responses
 	let syncResolvers = new Map<DataConnection, (offset: number) => void>();
-
-	function generateRoomCode(): string {
-		const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-		let code = '';
-		for (let i = 0; i < 5; i++) {
-			code += chars[Math.floor(Math.random() * chars.length)];
-		}
-		return code;
-	}
-
-	function peerIdFromCode(code: string): string {
-		return `buttongame-${code.toUpperCase()}`;
-	}
 
 	function sendTo(conn: DataConnection, msg: PeerMessage) {
 		conn.send(JSON.stringify(msg));
@@ -73,10 +52,6 @@
 		}
 	}
 
-	/**
-	 * Host: run SYNC_ROUNDS of ping/pong with a peer to measure clock offset.
-	 * offset = peerClock - hostClock (so peerTime ≈ hostTime + offset)
-	 */
 	function measureOffset(conn: DataConnection): Promise<number> {
 		return new Promise((resolve) => {
 			const offsets: number[] = [];
@@ -90,8 +65,7 @@
 						doRound();
 					} else {
 						syncResolvers.delete(conn);
-						offsets.sort((a, b) => a - b);
-						resolve(offsets[Math.floor(offsets.length / 2)]);
+						resolve(medianOffset(offsets));
 					}
 				});
 				sendTo(conn, { type: 'sync-ping', t1: performance.now() });
@@ -114,22 +88,19 @@
 				break;
 			}
 			case 'sync-ping': {
-				// Peer side: respond immediately with local timestamp
 				sendToHost({ type: 'sync-pong', t1: msg.t1, t2: performance.now() });
 				break;
 			}
 			case 'sync-pong': {
-				// Host side: compute offset from this round and resolve
 				if (from) {
 					const t3 = performance.now();
-					const offset = msg.t2 - (msg.t1 + t3) / 2;
+					const offset = computeClockOffset(msg.t1, msg.t2, t3);
 					const resolver = syncResolvers.get(from);
 					if (resolver) resolver(offset);
 				}
 				break;
 			}
 			case 'scheduled-start': {
-				// Peer side: beepAt is in our local clock
 				const delay = msg.beepAt - performance.now();
 				scheduleBeep(Math.max(0, delay));
 				break;
@@ -156,20 +127,12 @@
 		}
 	}
 
-	function createRoom() {
-		if (!playerName.trim()) {
-			error = 'Enter your name';
-			return;
-		}
-		error = '';
-		const code = generateRoomCode();
-		roomCode = code;
-		isHost = true;
-		players = [playerName.trim()];
-
-		peer = new Peer(peerIdFromCode(code));
+	function setupHost() {
+		peer = new Peer(PEER_ID);
 
 		peer.on('open', () => {
+			isHost = true;
+			players = [playerName.trim()];
 			phase = 'lobby';
 		});
 
@@ -184,26 +147,22 @@
 		});
 
 		peer.on('error', (err) => {
-			error = `Connection error: ${err.message}`;
+			if (err.type === 'unavailable-id') {
+				// Room already exists, join as peer instead
+				peer?.destroy();
+				setupJoiner();
+			} else {
+				error = `Connection error: ${err.message}`;
+			}
 		});
 	}
 
-	function joinRoom() {
-		if (!playerName.trim()) {
-			error = 'Enter your name';
-			return;
-		}
-		if (!joinCode.trim()) {
-			error = 'Enter a room code';
-			return;
-		}
-		error = '';
+	function setupJoiner() {
+		peer = new Peer();
 		isHost = false;
 
-		peer = new Peer();
-
 		peer.on('open', () => {
-			const conn = peer!.connect(peerIdFromCode(joinCode.trim()));
+			const conn = peer!.connect(PEER_ID);
 			hostConnection = conn;
 
 			conn.on('open', () => {
@@ -226,13 +185,21 @@
 		});
 	}
 
+	function joinGame() {
+		if (!playerName.trim()) {
+			error = 'Enter your name';
+			return;
+		}
+		error = '';
+		setupHost();
+	}
+
 	async function hostStart() {
 		if (!isHost) return;
 		expectedResults = players.length;
 		pendingResults = [];
 		phase = 'syncing';
 
-		// Measure clock offset for every connected peer
 		const offsets = new Map<DataConnection, number>();
 		await Promise.all(
 			connections.map(async (conn) => {
@@ -241,23 +208,41 @@
 			})
 		);
 
-		// Schedule beep SYNC_BUFFER_MS from now (in host clock)
-		const beepAtHostTime = performance.now() + SYNC_BUFFER_MS;
+		const beepAtHostTime = performance.now() + BEEP_DELAY_MS;
 
-		// Tell each peer when to beep, converted to their local clock
 		for (const conn of connections) {
 			const offset = offsets.get(conn) ?? 0;
 			sendTo(conn, { type: 'scheduled-start', beepAt: beepAtHostTime + offset });
 		}
 
-		// Schedule the host's own beep
-		scheduleBeep(SYNC_BUFFER_MS);
+		scheduleBeep(BEEP_DELAY_MS);
 	}
 
 	function scheduleBeep(delayMs: number) {
-		phase = 'syncing';
+		phase = 'countdown';
 		myTime = null;
+		countdown = null;
+
+		// Schedule countdown ticks: 3, 2, 1
+		const countdownStart = delayMs - 3000;
+		if (countdownStart >= 0) {
+			setTimeout(() => {
+				countdown = 3;
+				playCountdownTick();
+			}, countdownStart);
+			setTimeout(() => {
+				countdown = 2;
+				playCountdownTick();
+			}, countdownStart + 1000);
+			setTimeout(() => {
+				countdown = 1;
+				playCountdownTick();
+			}, countdownStart + 2000);
+		}
+
+		// Schedule the beep
 		setTimeout(() => {
+			countdown = null;
 			phase = 'playing';
 			buttonLit = true;
 			beepTimestamp = performance.now();
@@ -273,11 +258,7 @@
 		phase = 'pressed';
 		buttonLit = false;
 
-		const result: PlayerResult = {
-			name: playerName.trim(),
-			time: elapsed,
-			diff: Math.abs(elapsed - TARGET_SECONDS)
-		};
+		const result = calculateResult(playerName.trim(), elapsed);
 
 		if (isHost) {
 			pendingResults.push(result);
@@ -290,7 +271,7 @@
 	}
 
 	function finishGame() {
-		const sorted = [...pendingResults].sort((a, b) => a.diff - b.diff);
+		const sorted = sortResults(pendingResults);
 		results = sorted;
 		phase = 'results';
 		playResultBeep();
@@ -302,11 +283,8 @@
 		myTime = null;
 		results = [];
 		buttonLit = false;
+		countdown = null;
 		pendingResults = [];
-	}
-
-	function formatTime(t: number): string {
-		return t.toFixed(3) + 's';
 	}
 
 	onMount(() => {
@@ -328,6 +306,7 @@
 		class="big-button"
 		class:lit={buttonLit}
 		class:dimmed={phase === 'home' || phase === 'lobby' || phase === 'syncing'}
+		class:countdown-active={phase === 'countdown'}
 		class:pressed={phase === 'pressed'}
 		class:winner={phase === 'results'}
 		disabled={phase !== 'playing' && !(phase === 'lobby' && isHost)}
@@ -340,6 +319,8 @@
 			<span class="btn-text">13</span>
 		{:else if phase === 'syncing'}
 			<span class="btn-text sync-text">SYNC</span>
+		{:else if phase === 'countdown'}
+			<span class="btn-text countdown-text">{countdown ?? '...'}</span>
 		{:else if phase === 'lobby' && isHost}
 			<span class="btn-text">START</span>
 		{:else if phase === 'lobby'}
@@ -365,30 +346,14 @@
 				bind:value={playerName}
 				placeholder="Your name"
 				maxlength="20"
+				onkeydown={(e) => { if (e.key === 'Enter') joinGame(); }}
 			/>
-			<div class="actions">
-				<button class="action-btn host-btn" onclick={createRoom}>Create Room</button>
-				<div class="join-row">
-					<input
-						class="input code-input"
-						type="text"
-						bind:value={joinCode}
-						placeholder="Room code"
-						maxlength="5"
-					/>
-					<button class="action-btn join-btn" onclick={joinRoom}>Join</button>
-				</div>
-			</div>
+			<button class="action-btn host-btn" onclick={joinGame}>Join Game</button>
 		</div>
 	{/if}
 
 	{#if phase === 'lobby'}
 		<div class="panel">
-			{#if isHost}
-				<div class="room-code">
-					Room: <strong>{roomCode}</strong>
-				</div>
-			{/if}
 			<div class="player-list">
 				<h3>Players ({players.length})</h3>
 				{#each players as player}
@@ -406,6 +371,12 @@
 	{#if phase === 'syncing'}
 		<div class="panel">
 			<p class="hint sync-hint">Synchronizing devices...</p>
+		</div>
+	{/if}
+
+	{#if phase === 'countdown'}
+		<div class="panel">
+			<p class="hint countdown-hint">Get ready...</p>
 		</div>
 	{/if}
 
@@ -515,6 +486,16 @@
 		border-color: #330000;
 	}
 
+	.big-button.countdown-active {
+		background: radial-gradient(circle at 35% 35%, #cc6600, #994400, #662200);
+		border-color: #ff8800;
+		box-shadow:
+			0 0 40px rgba(255, 136, 0, 0.4),
+			0 0 80px rgba(255, 136, 0, 0.2),
+			0 8px 32px rgba(0, 0, 0, 0.5),
+			inset 0 -4px 12px rgba(0, 0, 0, 0.3);
+	}
+
 	.big-button.lit {
 		background: radial-gradient(circle at 35% 35%, #ff4400, #ee2200, #cc0000);
 		border-color: #ff6600;
@@ -573,6 +554,22 @@
 		animation: fade-blink 0.6s ease-in-out infinite;
 	}
 
+	.countdown-text {
+		font-size: 4rem;
+		animation: countdown-pop 1s ease-out;
+	}
+
+	@keyframes countdown-pop {
+		0% {
+			transform: scale(1.6);
+			opacity: 0.5;
+		}
+		100% {
+			transform: scale(1);
+			opacity: 1;
+		}
+	}
+
 	.panel {
 		margin-top: 2rem;
 		background: rgba(255, 255, 255, 0.05);
@@ -605,27 +602,6 @@
 		color: #666;
 	}
 
-	.code-input {
-		flex: 1;
-		text-transform: uppercase;
-		letter-spacing: 3px;
-		text-align: center;
-		font-weight: bold;
-		margin-bottom: 0;
-	}
-
-	.actions {
-		display: flex;
-		flex-direction: column;
-		gap: 0.75rem;
-	}
-
-	.join-row {
-		display: flex;
-		gap: 0.5rem;
-		align-items: center;
-	}
-
 	.action-btn {
 		padding: 0.75rem 1.5rem;
 		border: none;
@@ -634,6 +610,7 @@
 		font-weight: 600;
 		cursor: pointer;
 		transition: all 0.15s ease;
+		width: 100%;
 	}
 
 	.host-btn {
@@ -643,23 +620,6 @@
 
 	.host-btn:hover {
 		background: linear-gradient(135deg, #ff5555, #dd3300);
-	}
-
-	.join-btn {
-		background: rgba(255, 255, 255, 0.15);
-		color: #eee;
-		white-space: nowrap;
-	}
-
-	.join-btn:hover {
-		background: rgba(255, 255, 255, 0.25);
-	}
-
-	.room-code {
-		font-size: 1.5rem;
-		letter-spacing: 4px;
-		margin-bottom: 1rem;
-		color: #ffaa00;
 	}
 
 	.player-list h3 {
@@ -684,6 +644,11 @@
 	.sync-hint {
 		color: #ffaa00;
 		animation: fade-blink 0.8s ease-in-out infinite;
+	}
+
+	.countdown-hint {
+		font-size: 1.2rem;
+		color: #ff8800;
 	}
 
 	.playing-hint {
