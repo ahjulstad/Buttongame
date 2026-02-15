@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { playStartBeep, playCountdownTick, playResultBeep } from '$lib/audio';
+	import { initAudio, playStartBeep, playCountdownTick, playResultBeep } from '$lib/audio';
 	import {
 		TARGET_SECONDS,
 		SYNC_ROUNDS,
@@ -191,11 +191,13 @@
 			return;
 		}
 		error = '';
+		initAudio();
 		setupHost();
 	}
 
 	async function hostStart() {
 		if (!isHost) return;
+		initAudio();
 		expectedResults = players.length;
 		pendingResults = [];
 		phase = 'syncing';
