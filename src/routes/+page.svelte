@@ -4,8 +4,10 @@
 	import Peer, { type DataConnection } from 'peerjs';
 
 	const TARGET_SECONDS = 13;
+	const SYNC_ROUNDS = 5;
+	const SYNC_BUFFER_MS = 1500;
 
-	type GamePhase = 'home' | 'lobby' | 'playing' | 'pressed' | 'results';
+	type GamePhase = 'home' | 'lobby' | 'syncing' | 'playing' | 'pressed' | 'results';
 
 	interface PlayerResult {
 		name: string;
@@ -16,7 +18,9 @@
 	type PeerMessage =
 		| { type: 'join'; name: string }
 		| { type: 'player-list'; players: string[] }
-		| { type: 'start' }
+		| { type: 'sync-ping'; t1: number }
+		| { type: 'sync-pong'; t1: number; t2: number }
+		| { type: 'scheduled-start'; beepAt: number }
 		| { type: 'result'; name: string; time: number }
 		| { type: 'all-results'; results: PlayerResult[] };
 
@@ -37,6 +41,9 @@
 	let pendingResults: PlayerResult[] = [];
 	let expectedResults = 0;
 
+	// Host-side clock sync: resolvers waiting for pong responses
+	let syncResolvers = new Map<DataConnection, (offset: number) => void>();
+
 	function generateRoomCode(): string {
 		const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 		let code = '';
@@ -50,10 +57,13 @@
 		return `buttongame-${code.toUpperCase()}`;
 	}
 
+	function sendTo(conn: DataConnection, msg: PeerMessage) {
+		conn.send(JSON.stringify(msg));
+	}
+
 	function broadcast(msg: PeerMessage) {
-		const data = JSON.stringify(msg);
 		for (const conn of connections) {
-			conn.send(data);
+			sendTo(conn, msg);
 		}
 	}
 
@@ -63,13 +73,38 @@
 		}
 	}
 
+	/**
+	 * Host: run SYNC_ROUNDS of ping/pong with a peer to measure clock offset.
+	 * offset = peerClock - hostClock (so peerTime ≈ hostTime + offset)
+	 */
+	function measureOffset(conn: DataConnection): Promise<number> {
+		return new Promise((resolve) => {
+			const offsets: number[] = [];
+			let round = 0;
+
+			const doRound = () => {
+				syncResolvers.set(conn, (offset: number) => {
+					offsets.push(offset);
+					round++;
+					if (round < SYNC_ROUNDS) {
+						doRound();
+					} else {
+						syncResolvers.delete(conn);
+						offsets.sort((a, b) => a - b);
+						resolve(offsets[Math.floor(offsets.length / 2)]);
+					}
+				});
+				sendTo(conn, { type: 'sync-ping', t1: performance.now() });
+			};
+			doRound();
+		});
+	}
+
 	function handleMessage(msg: PeerMessage, from?: DataConnection) {
 		switch (msg.type) {
 			case 'join': {
-				if (isHost) {
-					if (!players.includes(msg.name)) {
-						players = [...players, msg.name];
-					}
+				if (isHost && !players.includes(msg.name)) {
+					players = [...players, msg.name];
 					broadcast({ type: 'player-list', players });
 				}
 				break;
@@ -78,8 +113,25 @@
 				players = msg.players;
 				break;
 			}
-			case 'start': {
-				startGame();
+			case 'sync-ping': {
+				// Peer side: respond immediately with local timestamp
+				sendToHost({ type: 'sync-pong', t1: msg.t1, t2: performance.now() });
+				break;
+			}
+			case 'sync-pong': {
+				// Host side: compute offset from this round and resolve
+				if (from) {
+					const t3 = performance.now();
+					const offset = msg.t2 - (msg.t1 + t3) / 2;
+					const resolver = syncResolvers.get(from);
+					if (resolver) resolver(offset);
+				}
+				break;
+			}
+			case 'scheduled-start': {
+				// Peer side: beepAt is in our local clock
+				const delay = msg.beepAt - performance.now();
+				scheduleBeep(Math.max(0, delay));
 				break;
 			}
 			case 'result': {
@@ -174,20 +226,43 @@
 		});
 	}
 
-	function hostStart() {
+	async function hostStart() {
 		if (!isHost) return;
 		expectedResults = players.length;
 		pendingResults = [];
-		broadcast({ type: 'start' });
-		startGame();
+		phase = 'syncing';
+
+		// Measure clock offset for every connected peer
+		const offsets = new Map<DataConnection, number>();
+		await Promise.all(
+			connections.map(async (conn) => {
+				const offset = await measureOffset(conn);
+				offsets.set(conn, offset);
+			})
+		);
+
+		// Schedule beep SYNC_BUFFER_MS from now (in host clock)
+		const beepAtHostTime = performance.now() + SYNC_BUFFER_MS;
+
+		// Tell each peer when to beep, converted to their local clock
+		for (const conn of connections) {
+			const offset = offsets.get(conn) ?? 0;
+			sendTo(conn, { type: 'scheduled-start', beepAt: beepAtHostTime + offset });
+		}
+
+		// Schedule the host's own beep
+		scheduleBeep(SYNC_BUFFER_MS);
 	}
 
-	function startGame() {
-		phase = 'playing';
-		buttonLit = true;
-		beepTimestamp = performance.now();
+	function scheduleBeep(delayMs: number) {
+		phase = 'syncing';
 		myTime = null;
-		playStartBeep();
+		setTimeout(() => {
+			phase = 'playing';
+			buttonLit = true;
+			beepTimestamp = performance.now();
+			playStartBeep();
+		}, delayMs);
 	}
 
 	function pressButton() {
@@ -252,7 +327,7 @@
 	<button
 		class="big-button"
 		class:lit={buttonLit}
-		class:dimmed={phase === 'home' || phase === 'lobby'}
+		class:dimmed={phase === 'home' || phase === 'lobby' || phase === 'syncing'}
 		class:pressed={phase === 'pressed'}
 		class:winner={phase === 'results'}
 		disabled={phase !== 'playing' && !(phase === 'lobby' && isHost)}
@@ -263,6 +338,8 @@
 	>
 		{#if phase === 'home'}
 			<span class="btn-text">13</span>
+		{:else if phase === 'syncing'}
+			<span class="btn-text sync-text">SYNC</span>
 		{:else if phase === 'lobby' && isHost}
 			<span class="btn-text">START</span>
 		{:else if phase === 'lobby'}
@@ -323,6 +400,12 @@
 			{:else}
 				<p class="hint">Waiting for host to start...</p>
 			{/if}
+		</div>
+	{/if}
+
+	{#if phase === 'syncing'}
+		<div class="panel">
+			<p class="hint sync-hint">Synchronizing devices...</p>
 		</div>
 	{/if}
 
@@ -486,6 +569,10 @@
 		letter-spacing: 2px;
 	}
 
+	.sync-text {
+		animation: fade-blink 0.6s ease-in-out infinite;
+	}
+
 	.panel {
 		margin-top: 2rem;
 		background: rgba(255, 255, 255, 0.05);
@@ -592,6 +679,11 @@
 		color: #888;
 		margin: 0.75rem 0 0;
 		font-size: 0.9rem;
+	}
+
+	.sync-hint {
+		color: #ffaa00;
+		animation: fade-blink 0.8s ease-in-out infinite;
 	}
 
 	.playing-hint {
