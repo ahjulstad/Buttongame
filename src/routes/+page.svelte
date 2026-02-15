@@ -7,6 +7,7 @@
 		BEEP_DELAY_MS,
 		PEER_ID,
 		formatTime,
+		randomName,
 		calculateResult,
 		sortResults,
 		computeClockOffset,
@@ -19,7 +20,7 @@
 
 	let phase = $state<GamePhase>('home');
 	let isHost = $state(false);
-	let playerName = $state('');
+	let playerName = $state(randomName());
 	let players = $state<string[]>([]);
 	let myTime = $state<number | null>(null);
 	let results = $state<PlayerResult[]>([]);
@@ -187,8 +188,7 @@
 
 	function joinGame() {
 		if (!playerName.trim()) {
-			error = 'Enter your name';
-			return;
+			playerName = randomName();
 		}
 		error = '';
 		initAudio();

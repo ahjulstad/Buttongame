@@ -20,6 +20,24 @@ export type PeerMessage =
 	| { type: 'result'; name: string; time: number }
 	| { type: 'all-results'; results: PlayerResult[] };
 
+const ADJECTIVES = [
+	'Swift', 'Lazy', 'Bold', 'Sneaky', 'Cosmic', 'Fuzzy', 'Mighty', 'Chill',
+	'Zappy', 'Turbo', 'Dizzy', 'Bouncy', 'Crispy', 'Wobbly', 'Spicy', 'Frosty',
+	'Jolly', 'Zippy', 'Stormy', 'Witty', 'Funky', 'Goofy', 'Lucky', 'Peppy'
+];
+
+const NOUNS = [
+	'Panda', 'Pickle', 'Waffle', 'Narwhal', 'Taco', 'Otter', 'Penguin', 'Mango',
+	'Llama', 'Donut', 'Parrot', 'Noodle', 'Walrus', 'Biscuit', 'Gecko', 'Moose',
+	'Badger', 'Turnip', 'Falcon', 'Pretzel', 'Squid', 'Muffin', 'Koala', 'Nugget'
+];
+
+export function randomName(): string {
+	const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
+	const noun = NOUNS[Math.floor(Math.random() * NOUNS.length)];
+	return `${adj} ${noun}`;
+}
+
 export function formatTime(t: number): string {
 	return t.toFixed(3) + 's';
 }

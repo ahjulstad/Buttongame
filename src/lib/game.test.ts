@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
 	formatTime,
+	randomName,
 	calculateResult,
 	sortResults,
 	computeClockOffset,
@@ -9,6 +10,25 @@ import {
 	TARGET_SECONDS,
 	BEEP_DELAY_MS
 } from './game';
+
+describe('randomName', () => {
+	it('returns a two-word name', () => {
+		const name = randomName();
+		const parts = name.split(' ');
+		expect(parts.length).toBe(2);
+		expect(parts[0].length).toBeGreaterThan(0);
+		expect(parts[1].length).toBeGreaterThan(0);
+	});
+
+	it('returns non-empty string', () => {
+		expect(randomName().trim().length).toBeGreaterThan(0);
+	});
+
+	it('generates different names (not always the same)', () => {
+		const names = new Set(Array.from({ length: 20 }, () => randomName()));
+		expect(names.size).toBeGreaterThan(1);
+	});
+});
 
 describe('formatTime', () => {
 	it('formats whole seconds with 3 decimal places', () => {
