@@ -2,6 +2,7 @@ export const TARGET_SECONDS = 13;
 export const SYNC_ROUNDS = 5;
 export const BEEP_DELAY_MS = 4000;
 export const PEER_ID = 'buttongame-room';
+export const SYNC_TIMEOUT_MS = 5000;
 
 export type GamePhase = 'home' | 'lobby' | 'syncing' | 'countdown' | 'playing' | 'pressed' | 'results';
 

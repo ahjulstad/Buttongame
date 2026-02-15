@@ -6,6 +6,7 @@
 		SYNC_ROUNDS,
 		BEEP_DELAY_MS,
 		PEER_ID,
+		SYNC_TIMEOUT_MS,
 		formatTime,
 		randomName,
 		calculateResult,
@@ -18,9 +19,11 @@
 	} from '$lib/game';
 	import Peer, { type DataConnection } from 'peerjs';
 
+	const NAME_KEY = 'buttongame-name';
+
 	let phase = $state<GamePhase>('home');
 	let isHost = $state(false);
-	let playerName = $state(randomName());
+	let playerName = $state('');
 	let players = $state<string[]>([]);
 	let myTime = $state<number | null>(null);
 	let results = $state<PlayerResult[]>([]);
@@ -34,38 +37,81 @@
 	let pendingResults: PlayerResult[] = [];
 	let expectedResults = 0;
 
-	// Host-side clock sync: resolvers waiting for pong responses
+	// Host-side: map connection → player name, and sync resolvers
+	let connNames = new Map<DataConnection, string>();
 	let syncResolvers = new Map<DataConnection, (offset: number) => void>();
+
+	/** The trimmed name used for all game messages. */
+	function myName(): string {
+		return playerName.trim() || randomName();
+	}
+
+	function saveName() {
+		try { localStorage.setItem(NAME_KEY, playerName); } catch {}
+	}
 
 	function sendTo(conn: DataConnection, msg: PeerMessage) {
 		conn.send(JSON.stringify(msg));
 	}
 
 	function broadcast(msg: PeerMessage) {
-		for (const conn of connections) {
-			sendTo(conn, msg);
-		}
+		for (const conn of connections) sendTo(conn, msg);
 	}
 
 	function sendToHost(msg: PeerMessage) {
-		if (hostConnection) {
-			hostConnection.send(JSON.stringify(msg));
-		}
+		if (hostConnection) hostConnection.send(JSON.stringify(msg));
+	}
+
+	function destroyPeer() {
+		peer?.destroy();
+		peer = null;
+		connections = [];
+		hostConnection = null;
+		connNames.clear();
+		syncResolvers.clear();
+	}
+
+	function resetGameState() {
+		myTime = null;
+		results = [];
+		buttonLit = false;
+		countdown = null;
+		pendingResults = [];
+		expectedResults = 0;
+	}
+
+	function goHome(msg?: string) {
+		destroyPeer();
+		resetGameState();
+		phase = 'home';
+		if (msg) error = msg;
 	}
 
 	function measureOffset(conn: DataConnection): Promise<number> {
-		return new Promise((resolve) => {
+		return new Promise((resolve, reject) => {
 			const offsets: number[] = [];
 			let round = 0;
+			let timer: ReturnType<typeof setTimeout>;
+
+			const cleanup = () => {
+				clearTimeout(timer);
+				syncResolvers.delete(conn);
+			};
 
 			const doRound = () => {
+				timer = setTimeout(() => {
+					cleanup();
+					reject(new Error(`Sync timeout for ${connNames.get(conn) ?? 'player'}`));
+				}, SYNC_TIMEOUT_MS);
+
 				syncResolvers.set(conn, (offset: number) => {
+					clearTimeout(timer);
 					offsets.push(offset);
 					round++;
 					if (round < SYNC_ROUNDS) {
 						doRound();
 					} else {
-						syncResolvers.delete(conn);
+						cleanup();
 						resolve(medianOffset(offsets));
 					}
 				});
@@ -75,13 +121,41 @@
 		});
 	}
 
+	function removeConnection(conn: DataConnection) {
+		const name = connNames.get(conn);
+		connNames.delete(conn);
+		connections = connections.filter((c) => c !== conn);
+
+		// Cancel any pending sync resolver
+		const resolver = syncResolvers.get(conn);
+		if (resolver) syncResolvers.delete(conn);
+
+		if (name) {
+			players = players.filter((p) => p !== name);
+			broadcast({ type: 'player-list', players });
+
+			// If waiting for this player's result, check if we can finish
+			if (phase === 'playing' || phase === 'pressed' || phase === 'countdown') {
+				expectedResults = Math.max(0, expectedResults - 1);
+				if (expectedResults > 0 && pendingResults.length >= expectedResults) {
+					finishGame();
+				}
+			}
+		}
+	}
+
 	function handleMessage(msg: PeerMessage, from?: DataConnection) {
 		switch (msg.type) {
 			case 'join': {
-				if (isHost && !players.includes(msg.name)) {
+				if (!isHost || !from) break;
+				// Reject joins while a game is in progress
+				if (phase !== 'lobby') break;
+				// Map connection to name
+				connNames.set(from, msg.name);
+				if (!players.includes(msg.name)) {
 					players = [...players, msg.name];
-					broadcast({ type: 'player-list', players });
 				}
+				broadcast({ type: 'player-list', players });
 				break;
 			}
 			case 'player-list': {
@@ -107,15 +181,14 @@
 				break;
 			}
 			case 'result': {
-				if (isHost) {
-					pendingResults.push({
-						name: msg.name,
-						time: msg.time,
-						diff: Math.abs(msg.time - TARGET_SECONDS)
-					});
-					if (pendingResults.length >= expectedResults) {
-						finishGame();
-					}
+				if (!isHost) break;
+				pendingResults.push({
+					name: msg.name,
+					time: msg.time,
+					diff: Math.abs(msg.time - TARGET_SECONDS)
+				});
+				if (pendingResults.length >= expectedResults) {
+					finishGame();
 				}
 				break;
 			}
@@ -129,11 +202,12 @@
 	}
 
 	function setupHost() {
+		destroyPeer();
 		peer = new Peer(PEER_ID);
 
 		peer.on('open', () => {
 			isHost = true;
-			players = [playerName.trim()];
+			players = [myName()];
 			phase = 'lobby';
 		});
 
@@ -142,23 +216,21 @@
 			conn.on('data', (data) => {
 				handleMessage(JSON.parse(data as string), conn);
 			});
-			conn.on('close', () => {
-				connections = connections.filter((c) => c !== conn);
-			});
+			conn.on('close', () => removeConnection(conn));
+			conn.on('error', () => removeConnection(conn));
 		});
 
 		peer.on('error', (err) => {
 			if (err.type === 'unavailable-id') {
-				// Room already exists, join as peer instead
-				peer?.destroy();
 				setupJoiner();
 			} else {
-				error = `Connection error: ${err.message}`;
+				goHome(`Could not connect. Check your network and try again.`);
 			}
 		});
 	}
 
 	function setupJoiner() {
+		destroyPeer();
 		peer = new Peer();
 		isHost = false;
 
@@ -168,28 +240,29 @@
 
 			conn.on('open', () => {
 				phase = 'lobby';
-				sendToHost({ type: 'join', name: playerName.trim() });
+				sendToHost({ type: 'join', name: myName() });
 			});
 
 			conn.on('data', (data) => {
 				handleMessage(JSON.parse(data as string));
 			});
 
-			conn.on('close', () => {
-				error = 'Disconnected from host';
-				phase = 'home';
-			});
+			conn.on('close', () => goHome('Lost connection to host.'));
+			conn.on('error', () => goHome('Lost connection to host.'));
 		});
 
 		peer.on('error', (err) => {
-			error = `Connection error: ${err.message}`;
+			if (err.type === 'peer-unavailable') {
+				goHome('No game found. Tap Join to start a new one.');
+			} else {
+				goHome('Could not connect. Check your network and try again.');
+			}
 		});
 	}
 
 	function joinGame() {
-		if (!playerName.trim()) {
-			playerName = randomName();
-		}
+		if (!playerName.trim()) playerName = randomName();
+		saveName();
 		error = '';
 		initAudio();
 		setupHost();
@@ -202,13 +275,21 @@
 		pendingResults = [];
 		phase = 'syncing';
 
+		// Sync clocks — drop players that fail to respond
 		const offsets = new Map<DataConnection, number>();
 		await Promise.all(
 			connections.map(async (conn) => {
-				const offset = await measureOffset(conn);
-				offsets.set(conn, offset);
+				try {
+					const offset = await measureOffset(conn);
+					offsets.set(conn, offset);
+				} catch {
+					removeConnection(conn);
+				}
 			})
 		);
+
+		// Recalculate after dropped players
+		expectedResults = players.length;
 
 		const beepAtHostTime = performance.now() + BEEP_DELAY_MS;
 
@@ -225,24 +306,13 @@
 		myTime = null;
 		countdown = null;
 
-		// Schedule countdown ticks: 3, 2, 1
 		const countdownStart = delayMs - 3000;
 		if (countdownStart >= 0) {
-			setTimeout(() => {
-				countdown = 3;
-				playCountdownTick();
-			}, countdownStart);
-			setTimeout(() => {
-				countdown = 2;
-				playCountdownTick();
-			}, countdownStart + 1000);
-			setTimeout(() => {
-				countdown = 1;
-				playCountdownTick();
-			}, countdownStart + 2000);
+			setTimeout(() => { countdown = 3; playCountdownTick(); }, countdownStart);
+			setTimeout(() => { countdown = 2; playCountdownTick(); }, countdownStart + 1000);
+			setTimeout(() => { countdown = 1; playCountdownTick(); }, countdownStart + 2000);
 		}
 
-		// Schedule the beep
 		setTimeout(() => {
 			countdown = null;
 			phase = 'playing';
@@ -260,15 +330,14 @@
 		phase = 'pressed';
 		buttonLit = false;
 
-		const result = calculateResult(playerName.trim(), elapsed);
+		const name = myName();
+		const result = calculateResult(name, elapsed);
 
 		if (isHost) {
 			pendingResults.push(result);
-			if (pendingResults.length >= expectedResults) {
-				finishGame();
-			}
+			if (pendingResults.length >= expectedResults) finishGame();
 		} else {
-			sendToHost({ type: 'result', name: playerName.trim(), time: elapsed });
+			sendToHost({ type: 'result', name, time: elapsed });
 		}
 	}
 
@@ -282,17 +351,13 @@
 
 	function playAgain() {
 		phase = 'lobby';
-		myTime = null;
-		results = [];
-		buttonLit = false;
-		countdown = null;
-		pendingResults = [];
+		resetGameState();
 	}
 
 	onMount(() => {
-		return () => {
-			peer?.destroy();
-		};
+		const saved = localStorage.getItem(NAME_KEY);
+		playerName = saved || randomName();
+		return () => destroyPeer();
 	});
 </script>
 
@@ -339,7 +404,7 @@
 		{:else if phase === 'results'}
 			<span class="btn-text">
 				{#if results.length > 0}
-					{results[0].name === playerName.trim() ? 'YOU WIN!' : results[0].name + ' wins!'}
+					{results[0].name === myName() ? 'YOU WIN!' : results[0].name + ' wins!'}
 				{/if}
 			</span>
 		{/if}
@@ -351,6 +416,7 @@
 				class="input"
 				type="text"
 				bind:value={playerName}
+				oninput={saveName}
 				placeholder="Your name"
 				maxlength="20"
 				onkeydown={(e) => { if (e.key === 'Enter') joinGame(); }}
@@ -405,7 +471,7 @@
 			<h3>Results</h3>
 			<div class="results-list">
 				{#each results as result, i}
-					<div class="result-row" class:is-winner={i === 0} class:is-me={result.name === playerName.trim()}>
+					<div class="result-row" class:is-winner={i === 0} class:is-me={result.name === myName()}>
 						<span class="rank">#{i + 1}</span>
 						<span class="result-name">{result.name}</span>
 						<span class="result-time">{formatTime(result.time)}</span>
