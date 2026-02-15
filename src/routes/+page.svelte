@@ -312,9 +312,14 @@
 		class:pressed={phase === 'pressed'}
 		class:winner={phase === 'results'}
 		disabled={phase !== 'playing' && !(phase === 'lobby' && isHost)}
+		onpointerdown={(e) => {
+			if (phase === 'playing') {
+				e.preventDefault();
+				pressButton();
+			}
+		}}
 		onclick={() => {
-			if (phase === 'playing') pressButton();
-			else if (phase === 'lobby' && isHost) hostStart();
+			if (phase === 'lobby' && isHost) hostStart();
 		}}
 	>
 		{#if phase === 'home'}
@@ -468,6 +473,7 @@
 			inset 0 -4px 12px rgba(0, 0, 0, 0.4);
 		transition: all 0.15s ease;
 		user-select: none;
+		touch-action: manipulation;
 		-webkit-tap-highlight-color: transparent;
 		outline: none;
 		display: flex;
